@@ -229,3 +229,13 @@ export interface SetSkillHubResult {
   /** 后端写入后的权威 projects 列表 */
   projects: Project[];
 }
+
+// ── Session listing ─────────────────────────────────────────────────────────
+
+export interface SessionListItem {
+  id: string;
+  path: string;
+  title: string | null;
+  modified_at: number;
+  agent?: "claude" | "codex";
+}

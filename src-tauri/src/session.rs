@@ -34,6 +34,10 @@ pub(crate) fn emit_task_status(app: &AppHandle, task_id: &str, status: &str) {
 }
 
 fn emit_active_task_status(app: &AppHandle, task_id: &str, status: &str) {
+    let tm = app.state::<TaskManager>();
+    if tm.finalized_tasks.lock().contains(task_id) {
+        return;
+    }
     if is_task_active(app, task_id) {
         emit_task_status(app, task_id, status);
     }
@@ -612,6 +616,200 @@ fn process_claude_session_line(
         }
         _ => {}
     }
+}
+
+// ── Session listing (for session picker UI) ─────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+pub struct SessionListItem {
+    pub id: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub modified_at: f64,
+}
+
+fn extract_session_title(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(50).map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let type_str = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if type_str == "custom-title" {
+            if let Some(title) = v.get("customTitle").and_then(|t| t.as_str()) {
+                if !title.trim().is_empty() {
+                    return Some(title.to_string());
+                }
+            }
+        }
+        if type_str == "user" {
+            let text = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| {
+                    if let Some(s) = c.as_str() {
+                        return Some(s.to_string());
+                    }
+                    c.as_array().and_then(|arr| {
+                        arr.iter().find_map(|b| {
+                            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                });
+            if let Some(t) = text {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    let preview: String = trimmed.chars().take(120).collect();
+                    return Some(preview);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+pub async fn list_project_sessions(project_path: String) -> Result<Vec<SessionListItem>, String> {
+    tokio::task::spawn_blocking(move || {
+        let sessions_dir = claude_sessions_dir_for_project(&project_path)
+            .ok_or_else(|| "Cannot determine sessions directory".to_string())?;
+
+        let entries = match std::fs::read_dir(&sessions_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut items: Vec<SessionListItem> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let file_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name.is_empty() {
+                continue;
+            }
+
+            let modified_at = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+
+            let title = extract_session_title(&path);
+
+            items.push(SessionListItem {
+                id: file_name.to_string(),
+                path: path.to_string_lossy().into_owned(),
+                title,
+                modified_at,
+            });
+        }
+
+        items.sort_by(|a, b| b.modified_at.partial_cmp(&a.modified_at).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(items)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn extract_codex_session_title(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(50).map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if event_type != "event_msg" {
+            continue;
+        }
+        let payload_type = v
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if payload_type == "user_message" {
+            let text = v
+                .get("payload")
+                .and_then(|p| p.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let preview: String = trimmed.chars().take(120).collect();
+                return Some(preview);
+            }
+        }
+    }
+    None
+}
+
+fn extract_codex_id_from_filename(file_name: &str) -> String {
+    // rollout-<timestamp>-<uuid> → extract the last 36-char UUID segment
+    let parts: Vec<&str> = file_name.rsplitn(6, '-').collect();
+    // UUID is 5 groups: 8-4-4-4-12, so last 5 parts when split by '-'
+    if parts.len() >= 5 {
+        let uuid = format!(
+            "{}-{}-{}-{}-{}",
+            parts[4], parts[3], parts[2], parts[1], parts[0]
+        );
+        if uuid.len() == 36 {
+            return uuid;
+        }
+    }
+    file_name.to_string()
+}
+
+#[tauri::command]
+pub async fn list_codex_sessions(project_path: String) -> Result<Vec<SessionListItem>, String> {
+    tokio::task::spawn_blocking(move || {
+        let files = collect_session_files_from_roots(&codex_sessions_roots(&project_path));
+
+        let mut items: Vec<SessionListItem> = Vec::new();
+        for path in files {
+            let file_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name.is_empty() {
+                continue;
+            }
+
+            let modified_at = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+
+            let title = extract_codex_session_title(&path);
+            let id = extract_codex_id_from_filename(file_name);
+
+            items.push(SessionListItem {
+                id,
+                path: path.to_string_lossy().into_owned(),
+                title,
+                modified_at,
+            });
+        }
+
+        items.sort_by(|a, b| {
+            b.modified_at
+                .partial_cmp(&a.modified_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(items)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ── Session messages (for conversation view) ──────────────────────────────────

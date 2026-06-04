@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -22,6 +23,18 @@ fn normalize_send_shortcut(value: String) -> String {
     }
 }
 
+fn default_zoom() -> u32 {
+    0
+}
+
+fn normalize_zoom(zoom: u32) -> u32 {
+    if zoom == 0 {
+        0
+    } else {
+        zoom.clamp(50, 200)
+    }
+}
+
 static CACHED_CLAUDE_VERSION: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
 static CACHED_CODEX_VERSION: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
 static SETTINGS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -42,6 +55,10 @@ pub struct AppSettings {
     pub codex_path: String,
     #[serde(default = "default_send_shortcut")]
     pub send_shortcut: String,
+    #[serde(default = "default_zoom")]
+    pub zoom: u32,
+    #[serde(default)]
+    pub keybindings: HashMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -50,6 +67,8 @@ impl Default for AppSettings {
             claude_path: String::new(),
             codex_path: String::new(),
             send_shortcut: default_send_shortcut(),
+            zoom: default_zoom(),
+            keybindings: HashMap::new(),
         }
     }
 }
@@ -306,6 +325,8 @@ fn normalize_settings(settings: AppSettings) -> AppSettings {
         claude_path: resolve_agent_launch_spec_from_path("claude", &settings.claude_path).program,
         codex_path: resolve_agent_launch_spec_from_path("codex", &settings.codex_path).program,
         send_shortcut: normalize_send_shortcut(settings.send_shortcut),
+        zoom: normalize_zoom(settings.zoom),
+        keybindings: settings.keybindings,
     }
 }
 
@@ -320,6 +341,8 @@ fn load_settings_unlocked() -> AppSettings {
             claude_path: detect_path("claude"),
             codex_path: detect_path("codex"),
             send_shortcut: default_send_shortcut(),
+            zoom: default_zoom(),
+            keybindings: HashMap::new(),
         });
         if let Ok(dir) = nezha_dir() {
             let _ = fs::create_dir_all(&dir);
@@ -403,6 +426,44 @@ pub async fn save_send_shortcut(send_shortcut: String) -> Result<AppSettings, St
         let _guard = settings_lock().lock();
         let mut settings = load_settings_unlocked();
         settings.send_shortcut = normalize_send_shortcut(send_shortcut);
+
+        let dir = nezha_dir()?;
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = settings_path()?;
+        let normalized = normalize_settings(settings);
+        let raw = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+        atomic_write(&path, &raw)?;
+        Ok::<AppSettings, String>(normalized)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn save_zoom(zoom: u32) -> Result<AppSettings, String> {
+    tokio::task::spawn_blocking(move || {
+        let _guard = settings_lock().lock();
+        let mut settings = load_settings_unlocked();
+        settings.zoom = normalize_zoom(zoom);
+
+        let dir = nezha_dir()?;
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = settings_path()?;
+        let normalized = normalize_settings(settings);
+        let raw = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+        atomic_write(&path, &raw)?;
+        Ok::<AppSettings, String>(normalized)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn save_keybindings(keybindings: HashMap<String, String>) -> Result<AppSettings, String> {
+    tokio::task::spawn_blocking(move || {
+        let _guard = settings_lock().lock();
+        let mut settings = load_settings_unlocked();
+        settings.keybindings = keybindings;
 
         let dir = nezha_dir()?;
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -547,4 +608,95 @@ pub async fn get_system_fonts() -> Vec<String> {
     })
     .await
     .unwrap_or_default()
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct AgentSlashCommand {
+    pub name: String,
+    pub description: String,
+    pub source: String, // "command" or "skill"
+}
+
+fn read_first_heading(path: &std::path::Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines().take(5) {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed.strip_prefix("# ") {
+            return Some(heading.to_string());
+        }
+    }
+    None
+}
+
+fn read_skill_description(dir: &std::path::Path) -> Option<String> {
+    let skill_file = dir.join("SKILL.md");
+    if !skill_file.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&skill_file).ok()?;
+    for line in content.lines().take(10) {
+        if let Some(desc) = line.strip_prefix("description:") {
+            let desc = desc.trim().trim_matches('"');
+            if !desc.is_empty() {
+                return Some(desc.chars().take(120).collect());
+            }
+        }
+    }
+    None
+}
+
+fn collect_agent_commands() -> Vec<AgentSlashCommand> {
+    let mut results = Vec::new();
+    let home = match crate::platform::home_dir() {
+        Some(h) => h,
+        None => return results,
+    };
+    let commands_dir = home.join(".claude").join("commands");
+    if commands_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&commands_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    let description = read_first_heading(&path).unwrap_or_default();
+                    results.push(AgentSlashCommand {
+                        name,
+                        description,
+                        source: "command".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let skills_dir = home.join(".claude").join("skills");
+    if skills_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&skills_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    if name.starts_with('.') || name.starts_with('_') {
+                        continue;
+                    }
+                    let description = read_skill_description(&path).unwrap_or_default();
+                    results.push(AgentSlashCommand {
+                        name,
+                        description,
+                        source: "skill".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+    results
+}
+
+#[tauri::command]
+pub async fn list_agent_slash_commands() -> Result<Vec<AgentSlashCommand>, String> {
+    tokio::task::spawn_blocking(collect_agent_commands)
+        .await
+        .map_err(|e| e.to_string())
 }

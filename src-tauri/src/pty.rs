@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -15,6 +16,8 @@ const SESSION_WAIT_MAX: Duration = Duration::from_millis(500);
 const PTY_READ_BUFFER_SIZE: usize = 32 * 1024;
 const PTY_EMIT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const PTY_EMIT_MAX_BATCH_BYTES: usize = 64 * 1024;
+/// PTY EOF 后等待 try_wait 返回退出状态的最大时间
+const EXIT_MONITOR_EOF_TIMEOUT: Duration = Duration::from_secs(10);
 /// 有界 channel 容量：满时 reader 线程阻塞，反压传播至 OS 内核 PTY 缓冲区，
 /// 最终使写入进程（Claude/Codex）的 write() 系统调用阻塞，从源头限流。
 const PTY_EMIT_CHANNEL_CAPACITY: usize = 32;
@@ -91,6 +94,11 @@ fn finalize_task_exit(
     if is_cancelled || is_manually_completed {
         let _ = fs::remove_dir_all(task_attachments_dir(project_path, task_id));
         return;
+    }
+
+    {
+        let tm = app.state::<TaskManager>();
+        tm.finalized_tasks.lock().insert(task_id.to_string());
     }
 
     let status = if exit_ok || had_agent_session { "done" } else { "failed" };
@@ -287,6 +295,7 @@ fn spawn_pty_reader(
     reader: Box<dyn Read + Send>,
     session_tx: Option<std::sync::mpsc::Sender<String>>,
     on_finish: Option<Box<dyn FnOnce() + Send>>,
+    pty_eof: Option<Arc<AtomicBool>>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut reader = reader;
@@ -382,6 +391,9 @@ fn spawn_pty_reader(
         if let Some(worker) = emit_worker {
             let _ = worker.join();
         }
+        if let Some(ref flag) = pty_eof {
+            flag.store(true, Ordering::Relaxed);
+        }
         // session_tx 在此处被 drop，watcher 端的 Receiver 将收到 Disconnected 信号
         if let Some(f) = on_finish {
             f();
@@ -390,28 +402,83 @@ fn spawn_pty_reader(
 }
 
 /// 在后台线程中轮询子进程退出状态，退出后调用 finalize_task_exit。
-fn spawn_exit_monitor(app: AppHandle, task_id: String, project_path: String, is_codex: bool) {
-    tokio::task::spawn_blocking(move || loop {
-        let exit_status = {
-            let tm = app.state::<TaskManager>();
-            let child_arc = tm.child_handles.lock().get(&task_id).cloned();
-            if let Some(arc) = child_arc {
-                arc.lock().unwrap().try_wait().ok().flatten()
-            } else {
-                return;
+/// 若 try_wait 连续返回错误超过阈值（通常是 ECHILD），视为进程已退出。
+/// 若 PTY reader 已 EOF 且超过 EXIT_MONITOR_EOF_TIMEOUT 仍未检测到退出，强制终结。
+fn spawn_exit_monitor(
+    app: AppHandle,
+    task_id: String,
+    project_path: String,
+    is_codex: bool,
+    pty_eof: Arc<AtomicBool>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut consecutive_errors: u32 = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 30; // 30 × 100ms = 3s
+        let mut eof_deadline: Option<Instant> = None;
+
+        loop {
+            // PTY EOF 超时兜底
+            if pty_eof.load(Ordering::Relaxed) {
+                let deadline = eof_deadline.get_or_insert_with(|| Instant::now() + EXIT_MONITOR_EOF_TIMEOUT);
+                if Instant::now() >= *deadline {
+                    eprintln!(
+                        "[exit_monitor] PTY EOF timeout for task {}, forcing finalize",
+                        task_id
+                    );
+                    wait_for_session(&app, &task_id, is_codex);
+                    finalize_task_exit(&app, &task_id, &project_path, is_codex, false, None);
+                    return;
+                }
             }
-        };
 
-        if let Some(status) = exit_status {
-            let exit_ok = status.success();
-            let exit_code = if exit_ok { None } else { Some(status.exit_code()) };
-            // 等待会话注册完成
-            wait_for_session(&app, &task_id, is_codex);
-            finalize_task_exit(&app, &task_id, &project_path, is_codex, exit_ok, exit_code);
-            return;
+            let wait_result = {
+                let tm = app.state::<TaskManager>();
+                let child_arc = tm.child_handles.lock().get(&task_id).cloned();
+                if let Some(arc) = child_arc {
+                    match arc.lock().unwrap().try_wait() {
+                        Ok(status) => Ok(status),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    return;
+                }
+            };
+
+            match wait_result {
+                Ok(Some(status)) => {
+                    let exit_ok = status.success();
+                    let exit_code = if exit_ok { None } else { Some(status.exit_code()) };
+                    wait_for_session(&app, &task_id, is_codex);
+                    finalize_task_exit(
+                        &app, &task_id, &project_path, is_codex, exit_ok, exit_code,
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    consecutive_errors = 0;
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    eprintln!(
+                        "[exit_monitor] try_wait error for task {}: {} (count: {})",
+                        task_id, e, consecutive_errors
+                    );
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        eprintln!(
+                            "[exit_monitor] too many try_wait errors for task {}, treating as exited",
+                            task_id
+                        );
+                        wait_for_session(&app, &task_id, is_codex);
+                        finalize_task_exit(
+                            &app, &task_id, &project_path, is_codex, false, None,
+                        );
+                        return;
+                    }
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
         }
-
-        std::thread::sleep(Duration::from_millis(100));
     });
 }
 
@@ -583,6 +650,7 @@ pub async fn run_task(
         pre_session_id,
         final_prompt.is_empty(),
     );
+    let pty_eof = Arc::new(AtomicBool::new(false));
     spawn_pty_reader(
         app.clone(),
         task_id.clone(),
@@ -594,8 +662,9 @@ pub async fn run_task(
         reader,
         Some(session_tx),
         None,
+        Some(pty_eof.clone()),
     );
-    spawn_exit_monitor(app, task_id, project_path, is_codex);
+    spawn_exit_monitor(app, task_id, project_path, is_codex, pty_eof);
 
     Ok(())
 }
@@ -611,7 +680,11 @@ pub async fn cancel_task(
     task_manager
         .manually_completed_tasks
         .lock()
-        .remove(&task_id);
+        .insert(task_id.clone());
+    task_manager
+        .finalized_tasks
+        .lock()
+        .insert(task_id.clone());
 
     let child_arc = task_manager.child_handles.lock().get(&task_id).cloned();
     if let Some(arc) = child_arc {
@@ -728,6 +801,8 @@ pub async fn resume_task(
     rows: Option<u16>,
     on_output: Channel<String>,
 ) -> Result<(), String> {
+    // 清除上一次运行留下的 finalized 标记，确保 session watcher 可以正常发射状态
+    task_manager.finalized_tasks.lock().remove(&task_id);
     task_manager.cancelled_tasks.lock().remove(&task_id);
     task_manager
         .manually_completed_tasks
@@ -751,7 +826,6 @@ pub async fn resume_task(
         c.arg(&session_id);
         c
     } else {
-        // resume 时 session_id 已知，使用 --resume 标志
         let mut c = build_claude_cmd(&agent_bin, &permission_mode);
         c.arg("--resume");
         c.arg(&session_id);
@@ -784,6 +858,7 @@ pub async fn resume_task(
         session_id,
         is_codex,
     );
+    let pty_eof = Arc::new(AtomicBool::new(false));
     spawn_pty_reader(
         app.clone(),
         task_id.clone(),
@@ -795,8 +870,9 @@ pub async fn resume_task(
         reader,
         None,
         None,
+        Some(pty_eof.clone()),
     );
-    spawn_exit_monitor(app, task_id, project_path, is_codex);
+    spawn_exit_monitor(app, task_id, project_path, is_codex, pty_eof);
 
     Ok(())
 }
@@ -901,6 +977,7 @@ pub async fn open_shell(
         reader,
         None,
         Some(on_finish),
+        None,
     );
 
     Ok(())
