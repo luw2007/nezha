@@ -228,7 +228,6 @@ export function ProjectPage({
     [handleFileSelect, openRightPanel],
   );
 
-  const { t } = useI18n();
   const [confirmHintMsg, setConfirmHintMsg] = useState<string | null>(null);
   const deleteConfirm = useShortcutConfirm({
     timeout: 2000,
@@ -629,7 +628,7 @@ export function ProjectPage({
 
       {showAppSettings && (
         <AppSettingsDialog
-          isDark={isDark}
+          themeVariant={themeVariant}
           themeMode={themeMode}
           systemPrefersDark={systemPrefersDark}
           onThemeModeChange={onThemeModeChange}
