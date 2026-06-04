@@ -12,8 +12,16 @@ import {
 import {
   PromptEditor,
   usePromptEditor,
+  getSlashInfo,
   type PromptEditorContent,
 } from "./new-task/PromptEditor";
+import { SlashCommandPopover } from "./new-task/SlashCommandPopover";
+import {
+  filterSlashCommands,
+  buildSlashCommandList,
+  type SlashCommand,
+  type AgentSlashCommand,
+} from "./new-task/slashCommands";
 import { ImageAttachments } from "./new-task/ImageAttachments";
 import { TextAttachments, type PastedText } from "./new-task/TextAttachments";
 import { AgentPermSelector } from "./new-task/AgentPermSelector";
@@ -96,11 +104,18 @@ export function NewTaskView({
 
   const [allFiles, setAllFiles] = useState<FileEntry[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
+  const [agentCommands, setAgentCommands] = useState<AgentSlashCommand[]>([]);
+  const allSlashCommands = useMemo(
+    () => buildSlashCommandList(agentCommands),
+    [agentCommands],
+  );
   const [crossProjectFiles, setCrossProjectFiles] = useState<CrossProjectFileMap>(new Map());
   const loadedProjectIds = useRef<Set<string>>(new Set());
 
   const [mentionSearch, setMentionSearch] = useState<string | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
+  const [slashSearch, setSlashSearch] = useState<string | null>(null);
+  const [slashIndex, setSlashIndex] = useState(0);
   const [pastedImages, setPastedImages] = useState<PastedImage[]>(
     initialDraft?.pastedImages ?? [],
   );
@@ -215,6 +230,13 @@ export function NewTaskView({
       .catch(() => setHasMdFile(false));
   }, [project.path, agent]);
 
+  // Load agent slash commands (commands + skills from ~/.claude/)
+  useEffect(() => {
+    invoke<AgentSlashCommand[]>("list_agent_slash_commands")
+      .then(setAgentCommands)
+      .catch(() => setAgentCommands([]));
+  }, []);
+
   // Load current project file list
   useEffect(() => {
     if (!project.path) return;
@@ -292,6 +314,48 @@ export function NewTaskView({
   const isCrossMode = activeCrossProject !== null;
   const isCrossLoading = isCrossMode && !crossProjectFiles.has(activeCrossProject!.id);
 
+  const slashItems = useMemo((): SlashCommand[] => {
+    if (slashSearch === null) return [];
+    return filterSlashCommands(allSlashCommands, slashSearch);
+  }, [slashSearch, allSlashCommands]);
+
+  function updateSlashState() {
+    const info = getSlashInfo();
+    if (info) {
+      setSlashSearch(info.query);
+      setSlashIndex(0);
+    } else {
+      setSlashSearch(null);
+    }
+  }
+
+  function handleSelectSlash(cmd: SlashCommand) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const info = getSlashInfo();
+    if (!info) return;
+
+    const { node, slashOffset, endOffset } = info;
+    const range = document.createRange();
+    range.setStart(node, slashOffset);
+    range.setEnd(node, endOffset);
+    range.deleteContents();
+
+    const templateNode = document.createTextNode(cmd.template);
+    range.insertNode(templateNode);
+
+    const newRange = document.createRange();
+    newRange.setStart(templateNode, templateNode.length);
+    newRange.collapse(true);
+    const sel = window.getSelection()!;
+    sel.removeAllRanges();
+    sel.addRange(newRange);
+
+    setSlashSearch(null);
+    setIsEmpty(false);
+    editor.focus();
+  }
+
   function updateMentionState() {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0) {
@@ -357,6 +421,7 @@ export function NewTaskView({
     editorHandle.clear();
     setIsEmpty(true);
     setMentionSearch(null);
+    setSlashSearch(null);
     setPastedImages([]);
     setPastedTexts([]);
   }
@@ -445,7 +510,7 @@ export function NewTaskView({
       {/* Compose card */}
       <div style={{ ...s.composeCard, position: "relative" }} onPaste={handleEditorPaste}>
         {/* Mention dropdown */}
-        {mentionSearch !== null && (
+        {mentionSearch !== null && slashSearch === null && (
           <MentionPopover
             mentionSearch={mentionSearch}
             mentionItems={mentionItems}
@@ -463,21 +528,37 @@ export function NewTaskView({
           />
         )}
 
+        {/* Slash command dropdown */}
+        {slashSearch !== null && (
+          <SlashCommandPopover
+            commands={slashItems}
+            activeIndex={slashIndex}
+            onSelect={handleSelectSlash}
+            onSetIndex={setSlashIndex}
+          />
+        )}
+
         {/* Inline editor */}
         <PromptEditor
           editorRef={editorRef}
           isComposingRef={isComposingRef}
           isEmpty={isEmpty}
-          mentionItems={mentionSearch !== null ? mentionItems : []}
+          mentionItems={mentionSearch !== null && slashSearch === null ? mentionItems : []}
           mentionIndex={mentionIndex}
+          slashCommands={slashSearch !== null ? slashItems : []}
+          slashIndex={slashIndex}
+          slashActive={slashSearch !== null}
           onSetIsEmpty={setIsEmpty}
           onUpdateMention={updateMentionState}
+          onUpdateSlash={updateSlashState}
           onSelectFile={() => setMentionSearch(null)}
           onSelectProject={(proj) => {
             setMentionSearch(`${proj.name}/`);
             setMentionIndex(0);
           }}
+          onSelectSlash={handleSelectSlash}
           onSetMentionIndex={setMentionIndex}
+          onSetSlashIndex={setSlashIndex}
           sendShortcut={sendShortcut}
           onSubmit={handleSubmit}
           onContentChange={(content) => {
