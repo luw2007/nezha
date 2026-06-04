@@ -275,8 +275,10 @@ export function WelcomePage({
                 filtered.map((p) => {
                   const [from] = getAvatarGradient(p.name);
                   return (
-                    <button
+                    <div
                       key={p.id}
+                      role="button"
+                      tabIndex={0}
                       style={{
                         ...s.projectItem,
                         background: hov === p.id ? "var(--bg-hover)" : "transparent",
@@ -285,6 +287,12 @@ export function WelcomePage({
                       onMouseEnter={() => setHov(p.id)}
                       onMouseLeave={() => setHov(null)}
                       onClick={() => onProjectClick(p)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onProjectClick(p);
+                        }
+                      }}
                     >
                       <ProjectAvatar
                         name={p.name}
@@ -370,7 +378,7 @@ export function WelcomePage({
                       >
                         <Trash2 size={14} strokeWidth={1.8} />
                       </button>
-                    </button>
+                    </div>
                   );
                 })
               )}
