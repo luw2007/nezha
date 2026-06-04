@@ -1,8 +1,27 @@
-import type React from "react";
+import { useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Check, Monitor } from "lucide-react";
 import type { ThemeMode } from "../../types";
 import { useI18n } from "../../i18n";
 import s from "../../styles";
+import { type AppSettings } from "./types";
+
+export function applyZoom(zoom: number) {
+  const root = document.getElementById("root");
+  if (!root) return;
+  if (zoom > 0 && zoom !== 100) {
+    const scale = zoom / 100;
+    root.style.transform = `scale(${scale})`;
+    root.style.transformOrigin = "top left";
+    root.style.width = `${100 / scale}%`;
+    root.style.height = `${100 / scale}%`;
+  } else {
+    root.style.transform = "";
+    root.style.transformOrigin = "";
+    root.style.width = "";
+    root.style.height = "";
+  }
+}
 
 interface ThemePanelProps {
   themeMode: ThemeMode;
@@ -17,6 +36,13 @@ export function ThemePanel({
 }: ThemePanelProps) {
   const { t } = useI18n();
   type ManualMode = Extract<ThemeMode, "dark" | "light" | "eyecare">;
+
+  useEffect(() => {
+    invoke<AppSettings>("load_app_settings").then((loaded) => {
+      applyZoom(loaded.zoom);
+    });
+  }, []);
+
   const manualThemeModes: ManualMode[] = ["dark", "light", "eyecare"];
   const currentModeLabel = systemPrefersDark ? t("theme.dark") : t("theme.light");
   const manualModeLabel =

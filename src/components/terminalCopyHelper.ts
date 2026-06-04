@@ -165,6 +165,14 @@ export function attachSmartCopy(terminal: Terminal): () => void {
   let copyInProgress = false;
 
   const handleCustomKeyEvent = (e: KeyboardEvent) => {
+    // Shift+Enter: emit CSI u sequence so CLI apps (Claude Code) can
+    // distinguish it from plain Enter (newline vs submit).
+    if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && e.type === "keydown") {
+      e.preventDefault();
+      terminal.input("\x1b[13;2u");
+      return false;
+    }
+
     const isCopy =
       (e.metaKey || e.ctrlKey) && e.key === "c" && e.type === "keydown";
 

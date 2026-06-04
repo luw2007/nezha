@@ -1,9 +1,15 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
 import { ToastProvider } from "./components/Toast";
 import { NotificationsProvider } from "./hooks/useNotifications";
 import { I18nProvider } from "./i18n";
+import { applyZoom } from "./components/app-settings/ThemePanel";
+
+invoke<{ zoom: number }>("load_app_settings")
+  .then((s) => applyZoom(s.zoom))
+  .catch(() => {});
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
