@@ -10,8 +10,10 @@ import type {
   TerminalFontSize,
   TaskDisplayWindow,
   FontFamily,
+  SessionListItem,
 } from "../types";
-import { TaskPanel } from "./TaskPanel";
+import { invoke } from "@tauri-apps/api/core";
+import { TaskPanel, type TaskPanelHandle } from "./TaskPanel";
 import { NewTaskView, type NewTaskDraft } from "./NewTaskView";
 import { RunningView } from "./RunningView";
 import { FileExplorer } from "./FileExplorer";
@@ -26,8 +28,14 @@ import { RightToolbar } from "./RightToolbar";
 import { TodoTaskView } from "./TodoTaskView";
 import { ShellTerminalPanel, type ShellTerminalPanelHandle } from "./ShellTerminalPanel";
 import { ErrorBoundary } from "./ErrorBoundary";
+import { ConfirmHint } from "./ConfirmHint";
 import { useProjectPanels } from "../hooks/useProjectPanels";
 import { useI18n } from "../i18n";
+import { useGlobalShortcuts } from "../hooks/useGlobalShortcuts";
+import { useShortcutConfirm } from "../hooks/useShortcutConfirm";
+import { AppSettingsDialog } from "./AppSettingsDialog";
+import type { Keybindings } from "../shortcuts";
+import { APP_SETTINGS_CHANGED_EVENT } from "./app-settings/types";
 import s from "../styles";
 
 export function ProjectPage({
@@ -56,6 +64,7 @@ export function ProjectPage({
   onDiscardWorktree,
   onReconnectTask,
   onMarkTaskDone,
+  onAttachSession,
   onInput,
   onResize,
   onRegisterTerminal,
@@ -91,7 +100,7 @@ export function ProjectPage({
   isNewTask: boolean;
   onNewTask: () => void;
   onSelectTask: (id: string) => void;
-  onDeleteTask: (id: string) => void;
+  onDeleteTask: (id: string, opts?: { skipConfirm?: boolean }) => void;
   onDeleteAllTasks: () => void;
   onToggleTaskStar: (id: string) => void;
   onRenameTask: (id: string, name: string) => void;
@@ -117,6 +126,7 @@ export function ProjectPage({
   onDiscardWorktree: (id: string) => Promise<void>;
   onReconnectTask: (id: string) => void;
   onMarkTaskDone: (id: string) => void;
+  onAttachSession: (session: SessionListItem, resume: boolean) => void;
   onInput: (taskId: string, data: string) => void;
   onResize: (taskId: string, cols: number, rows: number) => void;
   onRegisterTerminal: (
@@ -172,10 +182,26 @@ export function ProjectPage({
   const [showShellTerminal, setShowShellTerminal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showFileSearch, setShowFileSearch] = useState(false);
+  const [showAppSettings, setShowAppSettings] = useState(false);
   const [taskPanelCollapsed, setTaskPanelCollapsed] = useState(false);
+  const [keybindings, setKeybindings] = useState<Keybindings>({});
   const [mountedTaskIds, setMountedTaskIds] = useState<Set<string>>(() => new Set());
   const shellRef = useRef<ShellTerminalPanelHandle>(null);
+  const taskPanelRef = useRef<TaskPanelHandle>(null);
   const pendingCmdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    invoke<{ keybindings: Keybindings }>("load_app_settings")
+      .then((s) => setKeybindings(s.keybindings ?? {}))
+      .catch(() => {});
+    function onSettingsChanged() {
+      invoke<{ keybindings: Keybindings }>("load_app_settings")
+        .then((s) => setKeybindings(s.keybindings ?? {}))
+        .catch(() => {});
+    }
+    window.addEventListener(APP_SETTINGS_CHANGED_EVENT, onSettingsChanged);
+    return () => window.removeEventListener(APP_SETTINGS_CHANGED_EVENT, onSettingsChanged);
+  }, []);
   const prevHadDiffRef = useRef(false);
   const newTaskDraftRef = useRef<NewTaskDraft | null>(null);
   const handleCacheNewTaskDraft = useCallback((draft: NewTaskDraft | null) => {
@@ -201,6 +227,22 @@ export function ProjectPage({
     },
     [handleFileSelect, openRightPanel],
   );
+
+  const { t } = useI18n();
+  const [confirmHintMsg, setConfirmHintMsg] = useState<string | null>(null);
+  const deleteConfirm = useShortcutConfirm({
+    timeout: 2000,
+    onConfirm: () => {
+      if (selectedTaskId) onDeleteTask(selectedTaskId, { skipConfirm: true });
+    },
+    onArm: () => setConfirmHintMsg(t("confirm.pressAgainDelete")),
+    onDisarm: () => setConfirmHintMsg(null),
+  });
+
+  useEffect(() => {
+    deleteConfirm.disarm();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTaskId]);
 
   // 只挂载当前选中的任务的 xterm 实例，其他任务通过 snapshot 序列化后卸载。
   // 这样同时只有 1 个 WebGL context 存活，避免长时间运行后 GPU 内存累积。
@@ -257,6 +299,54 @@ export function ProjectPage({
     onNewTask();
   }, [onNewTask, clearFileAndDiff]);
 
+  useGlobalShortcuts(
+    useMemo(
+      () => ({
+        "new-task": handleNewTask,
+        "delete-task": () => {
+          if (selectedTaskId) deleteConfirm.trigger();
+        },
+        "prev-task": () => {
+          if (projectTasks.length === 0) return;
+          const idx = selectedTaskId
+            ? projectTasks.findIndex((t) => t.id === selectedTaskId)
+            : -1;
+          const prev = idx > 0 ? projectTasks[idx - 1] : projectTasks[projectTasks.length - 1];
+          if (prev) handleSelectTask(prev.id);
+        },
+        "next-task": () => {
+          if (projectTasks.length === 0) return;
+          const idx = selectedTaskId
+            ? projectTasks.findIndex((t) => t.id === selectedTaskId)
+            : -1;
+          const next =
+            idx >= 0 && idx < projectTasks.length - 1
+              ? projectTasks[idx + 1]
+              : projectTasks[0];
+          if (next) handleSelectTask(next.id);
+        },
+        "toggle-sidebar": () => setTaskPanelCollapsed((v) => !v),
+        "toggle-files": () => handleTogglePanel("files"),
+        "toggle-git-changes": () => handleTogglePanel("git-changes"),
+        "toggle-git-history": () => handleTogglePanel("git-history"),
+        "toggle-terminal": () => setShowShellTerminal((v) => !v),
+        "app-settings": () => setShowAppSettings((v) => !v),
+        "project-settings": () => setShowSettings((v) => !v),
+        "focus-search": () => taskPanelRef.current?.focusSearch(),
+      }),
+      [
+        handleNewTask,
+        selectedTaskId,
+        projectTasks,
+        handleSelectTask,
+        handleTogglePanel,
+        deleteConfirm,
+      ],
+    ),
+    visible,
+    keybindings,
+  );
+
   const currentTaskCreatedAt = selectedTask?.createdAt ?? null;
 
   return (
@@ -276,6 +366,7 @@ export function ProjectPage({
         zIndex: visible ? 1 : 0,
       }}
     >
+      <ConfirmHint visible={!!confirmHintMsg} message={confirmHintMsg ?? ""} />
       <ProjectRail
         projects={allProjects}
         allTasks={tasks}
@@ -285,6 +376,7 @@ export function ProjectPage({
         singleProjectMode={hubMode}
       />
       <TaskPanel
+        ref={taskPanelRef}
         project={project}
         tasks={projectTasks}
         selectedId={selectedTaskId}
@@ -295,6 +387,7 @@ export function ProjectPage({
         onDeleteAllTasks={onDeleteAllTasks}
         onToggleTaskStar={onToggleTaskStar}
         onRunTodo={onRunTodoTask}
+        onAttachSession={onAttachSession}
         onBack={hubMode ? (onExitSkillHub ?? onBack) : onBack}
         backTitle={hubMode ? t("skill.taskView.back") : undefined}
         themeVariant={themeVariant}
@@ -532,6 +625,24 @@ export function ProjectPage({
 
       {showSettings && (
         <SettingsDialog projectPath={project.path} onClose={() => setShowSettings(false)} />
+      )}
+
+      {showAppSettings && (
+        <AppSettingsDialog
+          isDark={isDark}
+          themeMode={themeMode}
+          systemPrefersDark={systemPrefersDark}
+          onThemeModeChange={onThemeModeChange}
+          terminalFontSize={terminalFontSize}
+          onTerminalFontSizeChange={onTerminalFontSizeChange}
+          taskDisplayWindow={taskDisplayWindow}
+          onTaskDisplayWindowChange={onTaskDisplayWindowChange}
+          uiFontFamily={uiFontFamily}
+          onUiFontFamilyChange={onUiFontFamilyChange}
+          monoFontFamily={monoFontFamily}
+          onMonoFontFamilyChange={onMonoFontFamilyChange}
+          onClose={() => setShowAppSettings(false)}
+        />
       )}
     </div>
   );

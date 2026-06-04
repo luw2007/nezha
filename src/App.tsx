@@ -14,6 +14,7 @@ import type {
   TerminalFontSize,
   TaskDisplayWindow,
   SkillHubConfig,
+  SessionListItem,
 } from "./types";
 import {
   isActiveTaskStatus,
@@ -33,6 +34,7 @@ import { SKILL_HUB_CHANGED_EVENT } from "./components/app-settings/types";
 import { useToast } from "./components/Toast";
 import { useTerminalManager } from "./hooks/useTerminalManager";
 import { useWorktreeDiffStats } from "./hooks/useWorktreeDiffStats";
+import { useWindowCloseGuard } from "./hooks/useWindowCloseGuard";
 import { useI18n } from "./i18n";
 import s from "./styles";
 import "./App.css";
@@ -195,6 +197,7 @@ function App() {
 
   const tm = useTerminalManager();
   const pendingResumeStartsRef = useRef<Record<string, () => void>>({});
+  useWindowCloseGuard(true);
 
   const formatSaveProjectsError = useCallback(
     (error: string) => t("toast.saveProjectsFailed", { error }),
@@ -223,14 +226,23 @@ function App() {
   }, []);
 
   const updateProjectView = useCallback((projectId: string, patch: Partial<ProjectViewState>) => {
-    setProjectViews((prev) => ({
-      ...prev,
-      [projectId]: {
-        ...createDefaultProjectViewState(),
-        ...prev[projectId],
-        ...patch,
-      },
-    }));
+    setProjectViews((prev) => {
+      const next = {
+        ...prev,
+        [projectId]: {
+          ...createDefaultProjectViewState(),
+          ...prev[projectId],
+          ...patch,
+        },
+      };
+      const taskId = next[projectId].selectedTaskId;
+      if (taskId) {
+        localStorage.setItem(`nezha:selectedTask:${projectId}`, taskId);
+      } else {
+        localStorage.removeItem(`nezha:selectedTask:${projectId}`);
+      }
+      return next;
+    });
   }, []);
 
   const clearProjectView = useCallback((projectId: string) => {
@@ -240,6 +252,7 @@ function App() {
       delete next[projectId];
       return next;
     });
+    localStorage.removeItem(`nezha:selectedTask:${projectId}`);
   }, []);
 
   function getProjectView(projectId: string): ProjectViewState {
@@ -307,11 +320,9 @@ function App() {
 
   useEffect(() => {
     async function init() {
-      // Load projects from ~/.nezha/projects.json
       const loadedProjects = await invoke<Project[]>("load_projects");
       setProjects(loadedProjects);
 
-      // Load tasks for all known projects
       const chunks = await Promise.all(
         loadedProjects.map((p) => invoke<Task[]>("load_project_tasks", { projectId: p.id })),
       );
@@ -324,6 +335,25 @@ function App() {
       changedProjectIds.forEach((projectId) => {
         persistProjectTasksQuietly(projectId, loadedTasks);
       });
+
+      // Restore last active project
+      const lastProjectId = localStorage.getItem("nezha:lastProjectId");
+      const lastProject = lastProjectId
+        ? loadedProjects.find((p) => p.id === lastProjectId)
+        : null;
+      const target =
+        lastProject ??
+        [...loadedProjects].sort((a, b) => b.lastOpenedAt - a.lastOpenedAt)[0] ??
+        null;
+
+      if (target) {
+        setActiveProject(target);
+        setMountedProjectIds([target.id]);
+        const savedTaskId = localStorage.getItem(`nezha:selectedTask:${target.id}`);
+        if (savedTaskId && loadedTasks.some((t) => t.id === savedTaskId && t.projectId === target.id)) {
+          setProjectViews({ [target.id]: { selectedTaskId: savedTaskId, isNewTask: false } });
+        }
+      }
     }
 
     init().catch(console.error);
@@ -415,6 +445,7 @@ function App() {
       return next;
     });
     setActiveProject(project);
+    localStorage.setItem("nezha:lastProjectId", project.id);
     mountProject(project.id);
     updateProjectView(project.id, createDefaultProjectViewState());
     invoke("init_project_config", { projectPath: path }).catch((e: unknown) => {
@@ -431,6 +462,7 @@ function App() {
     });
     setActiveProject(updated);
     setHubMode(false);
+    localStorage.setItem("nezha:lastProjectId", updated.id);
     mountProject(updated.id);
     invoke("init_project_config", { projectPath: project.path }).catch((e: unknown) => {
       showToast(t("toast.initProjectConfigFailed", { error: String(e) }), "warning");
@@ -642,11 +674,16 @@ function App() {
     }
   }
 
-  function handleCancelTask(taskId: string) {
+  async function handleCancelTask(taskId: string) {
     delete pendingResumeStartsRef.current[taskId];
     const task = tasks.find((t) => t.id === taskId);
     const project = projects.find((p) => p.id === task?.projectId);
     const projectPath = task?.worktreePath ?? project?.path ?? "";
+    const ok = await confirm(t("confirm.cancelTask"), {
+      title: t("confirm.cancelTaskTitle"),
+      kind: "warning",
+    });
+    if (!ok) return;
     invoke("cancel_task", { taskId, projectPath }).catch((e: unknown) => {
       showToast(t("toast.cancelTaskFailed", { error: String(e) }));
     });
@@ -752,6 +789,48 @@ function App() {
     });
   }
 
+  function handleAttachSession(project: Project, session: SessionListItem, resume: boolean) {
+    const taskId = `${Date.now()}`;
+    const agent = session.agent ?? "claude";
+    const task: Task = {
+      id: taskId,
+      projectId: project.id,
+      prompt: session.title ?? `Session ${session.id.slice(0, 8)}`,
+      agent,
+      permissionMode: "ask",
+      status: resume ? "pending" : "done",
+      createdAt: Date.now(),
+      ...(agent === "claude"
+        ? { claudeSessionId: session.id, claudeSessionPath: session.path }
+        : { codexSessionId: session.id, codexSessionPath: session.path }),
+    };
+    setTasks((prev) => {
+      const next = [task, ...prev];
+      persistProjectTasks(task.projectId, next, showToast, formatSaveTasksError);
+      return next;
+    });
+    updateProjectView(project.id, { selectedTaskId: taskId, isNewTask: false });
+
+    if (!resume) return;
+
+    tm.resetTaskTerminal(taskId);
+    setTaskRunCounts((prev) => ({ ...prev, [taskId]: (prev[taskId] ?? 0) + 1 }));
+    invoke("resume_task", {
+      taskId,
+      projectPath: project.path,
+      agent,
+      sessionId: session.id,
+      prompt: task.prompt,
+      permissionMode: task.permissionMode,
+      cols: tm.terminalSizeRef.current.cols,
+      rows: tm.terminalSizeRef.current.rows,
+    }).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      tm.writeErrorToTerminal(taskId, `\r\nError: ${msg}\r\n`);
+      updateTaskStatus(taskId, "failed", undefined, msg);
+    });
+  }
+
   function deleteTasks(taskIds: string[]) {
     if (taskIds.length === 0) return;
 
@@ -811,15 +890,17 @@ function App() {
     });
   }
 
-  async function handleDeleteTask(taskId: string) {
+  async function handleDeleteTask(taskId: string, opts?: { skipConfirm?: boolean }) {
     const task = tasks.find((item) => item.id === taskId);
     if (!task) return;
-    const promptPreview = `${task.prompt.slice(0, 100)}${task.prompt.length > 100 ? "..." : ""}`;
-    const ok = await confirm(t("task.deletePrompt", { prompt: promptPreview }), {
-      title: t("task.deleteTitle"),
-      kind: "warning",
-    });
-    if (!ok) return;
+    if (!opts?.skipConfirm) {
+      const promptPreview = `${task.prompt.slice(0, 100)}${task.prompt.length > 100 ? "..." : ""}`;
+      const ok = await confirm(t("task.deletePrompt", { prompt: promptPreview }), {
+        title: t("task.deleteTitle"),
+        kind: "warning",
+      });
+      if (!ok) return;
+    }
     deleteTasks([taskId]);
   }
 
@@ -967,6 +1048,8 @@ function App() {
       const next = prev.map((task) => {
         if (task.id !== taskId) return task;
         if (shouldIgnoreTaskStatusTransition(task.status, status)) return task;
+
+        if (!isActiveTaskStatus(task.status) && isActiveTaskStatus(status)) return task;
 
         const attentionRequestedAt =
           status === "input_required" ? (extra?.attentionRequestedAt ?? Date.now()) : undefined;
@@ -1119,6 +1202,7 @@ function App() {
               onDiscardWorktree={handleDiscardWorktree}
               onReconnectTask={handleReconnectTask}
               onMarkTaskDone={handleMarkTaskDone}
+              onAttachSession={(session, resume) => handleAttachSession(project, session, resume)}
               onInput={tm.handleInput}
               onResize={tm.handleResize}
               onRegisterTerminal={tm.handleRegisterTerminal}
